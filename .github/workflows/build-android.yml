@@ -1,0 +1,41 @@
+name: Build UABEA Android
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+        submodules: recursive
+
+    - name: Install .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+
+    - name: Install Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
+
+    - name: Install Android workload
+      run: dotnet workload install android
+
+    - name: Build APK
+      run: dotnet publish UABEANext4.Android/UABEANext4.Android.csproj -c Release -f net8.0-android -o out
+
+    - name: List output
+      run: find out -name "*.apk"
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: uabea-android
+        path: out/*.apk
