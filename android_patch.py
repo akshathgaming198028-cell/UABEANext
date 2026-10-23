@@ -790,11 +790,18 @@ replace_once(
     "            {\n"
     "                DataContext = new MainViewModel()\n"
     "            };\n",
-    "            var rootGrid = new Grid();\n"
-    "            rootGrid.Children.Add(new MainView\n"
+    "            var mainVm = new MainViewModel();\n"
+    "            Control mainContent;\n"
+    "            try\n"
     "            {\n"
-    "                DataContext = new MainViewModel()\n"
-    "            });\n"
+    "                mainContent = new AndroidShellView(mainVm);\n"
+    "            }\n"
+    "            catch (Exception)\n"
+    "            {\n"
+    "                mainContent = new MainView { DataContext = mainVm };\n"
+    "            }\n"
+    "            var rootGrid = new Grid();\n"
+    "            rootGrid.Children.Add(mainContent);\n"
     "            var overlayLayer = new Grid();\n"
     "            rootGrid.Children.Add(overlayLayer);\n"
     "            OverlayHost.Init(overlayLayer);\n"
@@ -832,6 +839,8 @@ replace_once(
         AddMinHeight(new Avalonia.Styling.Style(x => x.OfType<Avalonia.Controls.TreeViewItem>()), 38d);
         AddMinHeight(new Avalonia.Styling.Style(x => x.OfType<Avalonia.Controls.MenuItem>()), 40d);
         AddMinHeight(new Avalonia.Styling.Style(x => x.OfType<Avalonia.Controls.Button>()), 38d);
+        AddMinHeight(new Avalonia.Styling.Style(x => x.OfType<Avalonia.Controls.DataGridRow>()), 40d);
+        AddMinHeight(new Avalonia.Styling.Style(x => x.OfType<Avalonia.Controls.TabItem>()), 44d);
     }
 
     private IServiceProvider ConfigureServices(Window? mainWindow)""",
@@ -1000,6 +1009,828 @@ replace_once(
     "        Plugins.LoadPluginsInDirectory(pluginsPath);\n        Plugins.LoadBuiltInPlugins();\n",
 )
 
+# ================================================================ v3: texture crash fix, speed, tablet layout
+
+# ---- TextureLoader: smaller cache, size guard, downscaled preview
+replace_once(
+    "TexturePlugin/Helpers/TextureLoader.cs",
+    "public const int DEFAULT_MAX_SPRITE_IMAGE_CACHE_SIZE = 10;",
+    "public const int DEFAULT_MAX_SPRITE_IMAGE_CACHE_SIZE = 2;\n"
+    "    public const long MAX_DECODE_PIXELS = 4096L * 4096L;\n"
+    "    public const int PREVIEW_MAX_SIDE = 2048;",
+)
+replace_once(
+    "TexturePlugin/Helpers/TextureLoader.cs",
+    "public class TextureLoader\n{",
+    "public class TexturePreviewTooLargeException : System.Exception\n"
+    "{\n"
+    "    public TexturePreviewTooLargeException(int width, int height)\n"
+    "        : base($\"This texture is {width} x {height} px. Preview was skipped because it is too big for this device and would crash the app.\")\n"
+    "    {\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "public class TextureLoader\n{",
+)
+replace_once(
+    "TexturePlugin/Helpers/TextureLoader.cs",
+    "            var encTextureData = texture.FillPictureData(textureAsset.FileInstance);\n",
+    "            if ((long)texture.m_Width * texture.m_Height > MAX_DECODE_PIXELS)\n"
+    "            {\n"
+    "                return null;\n"
+    "            }\n"
+    "\n"
+    "            var encTextureData = texture.FillPictureData(textureAsset.FileInstance);\n",
+)
+replace_once(
+    "TexturePlugin/Helpers/TextureLoader.cs",
+    "    public static Bitmap? GetTexture2DBitmap(Workspace workspace, AssetInst asset, out TextureFormat format)\n    {\n",
+    r'''    private static byte[] DownscaleBgra(byte[] src, int w, int h, int step, out int outW, out int outH)
+    {
+        outW = System.Math.Max(1, w / step);
+        outH = System.Math.Max(1, h / step);
+        var dst = new byte[outW * outH * 4];
+        int area = step * step;
+        for (int y = 0; y < outH; y++)
+        {
+            for (int x = 0; x < outW; x++)
+            {
+                int b = 0, g = 0, r = 0, a = 0;
+                for (int dy = 0; dy < step; dy++)
+                {
+                    int i = ((y * step + dy) * w + x * step) * 4;
+                    for (int dx = 0; dx < step; dx++)
+                    {
+                        b += src[i];
+                        g += src[i + 1];
+                        r += src[i + 2];
+                        a += src[i + 3];
+                        i += 4;
+                    }
+                }
+                int o = (y * outW + x) * 4;
+                dst[o] = (byte)(b / area);
+                dst[o + 1] = (byte)(g / area);
+                dst[o + 2] = (byte)(r / area);
+                dst[o + 3] = (byte)(a / area);
+            }
+        }
+        return dst;
+    }
+
+    public static Bitmap? GetTexture2DBitmap(Workspace workspace, AssetInst asset, out TextureFormat format)
+    {
+        var textureEditBf = TextureHelper.GetByteArrayTexture(workspace, asset);
+        var texture = TextureFile.ReadTextureFile(textureEditBf);
+        format = (TextureFormat)texture.m_TextureFormat;
+
+        int width = texture.m_Width;
+        int height = texture.m_Height;
+        if (width <= 0 || height <= 0)
+        {
+            return null;
+        }
+        if ((long)width * height > MAX_DECODE_PIXELS)
+        {
+            throw new TexturePreviewTooLargeException(width, height);
+        }
+
+        if (texture.m_PlatformBlob.Length != 0)
+        {
+            TextureHelper.SwizzleOptIn(texture, asset.FileInstance.file);
+        }
+
+        var encTextureData = texture.FillPictureData(asset.FileInstance);
+        if (encTextureData is null || encTextureData.Length == 0)
+        {
+            return null;
+        }
+
+        var data = texture.DecodeTextureRaw(encTextureData);
+        encTextureData = null;
+        if (data == null || data.Length < (long)width * height * 4)
+        {
+            return null;
+        }
+
+        int outW = width;
+        int outH = height;
+        int step = System.Math.Max(1, (System.Math.Max(width, height) + PREVIEW_MAX_SIDE - 1) / PREVIEW_MAX_SIDE);
+        if (step > 1)
+        {
+            data = DownscaleBgra(data, width, height, step, out outW, out outH);
+        }
+
+        var bmp = new WriteableBitmap(new PixelSize(outW, outH), new Vector(96, 96), PixelFormat.Bgra8888, AlphaFormat.Unpremul);
+        using (var fb = bmp.Lock())
+        {
+            int rowBytes = outW * 4;
+            if (fb.RowBytes == rowBytes)
+            {
+                Marshal.Copy(data, 0, fb.Address, rowBytes * outH);
+            }
+            else
+            {
+                for (int y = 0; y < outH; y++)
+                {
+                    Marshal.Copy(data, y * rowBytes, fb.Address + y * fb.RowBytes, rowBytes);
+                }
+            }
+        }
+
+        return bmp;
+    }
+
+    public static Bitmap? GetTexture2DBitmapOld(Workspace workspace, AssetInst asset, out TextureFormat format)
+    {
+''',
+)
+
+write("TexturePlugin/TexturePreviewer.cs", r'''using AssetsTools.NET.Extra;
+using AssetsTools.NET.Texture;
+using Avalonia.Media.Imaging;
+using TexturePlugin.Helpers;
+using UABEANext4.AssetWorkspace;
+using UABEANext4.Logic.Mesh;
+using UABEANext4.Plugins;
+
+namespace TexturePlugin;
+public class TexturePreviewer : IUavPluginPreviewer
+{
+    public string Name => "Preview Texture2D";
+    public string Description => "Preview Texture2Ds";
+
+    public UavPluginPreviewerType SupportsPreview(Workspace workspace, AssetInst selection)
+    {
+        var previewType = selection.Type == AssetClassID.Texture2D
+            ? UavPluginPreviewerType.Image
+            : UavPluginPreviewerType.None;
+
+        return previewType;
+    }
+
+    public (Bitmap?, int) ExecuteImage(Workspace workspace, IUavPluginFunctions funcs, AssetInst selection, out string? error)
+    {
+        try
+        {
+            var image = TextureLoader.GetTexture2DBitmap(workspace, selection, out TextureFormat format);
+            if (image != null)
+            {
+                error = null;
+                return (image, (int)format);
+            }
+            else
+            {
+                error = $"This texture could not be previewed. The format may not be supported, or it has no data. ({format})";
+                return (null, (int)format);
+            }
+        }
+        catch (TexturePreviewTooLargeException ex)
+        {
+            error = ex.Message;
+            return (null, -1);
+        }
+        catch (OutOfMemoryException)
+        {
+            GC.Collect();
+            error = "Not enough memory to preview this texture.";
+            return (null, -1);
+        }
+        catch (Exception ex)
+        {
+            error = $"Texture preview failed: {ex.Message}";
+            return (null, -1);
+        }
+    }
+
+    public MeshObj? ExecuteMesh(Workspace workspace, IUavPluginFunctions funcs, AssetInst selection, out string? error)
+        => throw new InvalidOperationException();
+
+    public string? ExecuteText(Workspace workspace, IUavPluginFunctions funcs, AssetInst selection, out string? error)
+        => throw new InvalidOperationException();
+
+    public void Cleanup() { }
+}
+''')
+
+# ---- Previewer view model: decode in the background, drop stale requests
+write("UABEANext4/ViewModels/Tools/PreviewerToolViewModel.cs", r'''using AvaloniaEdit.Document;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Messaging;
+using Dock.Model.Mvvm.Controls;
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using UABEANext4.AssetWorkspace;
+using UABEANext4.Logic;
+using UABEANext4.Logic.Mesh;
+using UABEANext4.Plugins;
+
+namespace UABEANext4.ViewModels.Tools;
+
+public partial class PreviewerToolViewModel : Tool
+{
+    const string TOOL_TITLE = "Previewer";
+    private const int MAX_TEXT_CHARS = 200_000;
+
+    public Workspace Workspace { get; }
+
+    [ObservableProperty]
+    public TextDocument? _activeDocument;
+    [ObservableProperty]
+    public MeshObj? _activeMesh;
+    [ObservableProperty]
+    public PreviewerToolPreviewType _activePreviewType = PreviewerToolPreviewType.Text;
+
+    [ObservableProperty]
+    public ImagePreviewViewModel _imagePreview = new();
+
+    // defer this to first preview since dialogs won't exist until after initial load
+    private readonly Lazy<UavPluginFunctions> _uavPluginFuncs = new(() => new UavPluginFunctions());
+
+    private CancellationTokenSource? _cts;
+    private readonly SemaphoreSlim _gate = new(1, 1);
+
+    [Obsolete("This constructor is for the designer only and should not be used directly.", true)]
+    public PreviewerToolViewModel()
+    {
+        Workspace = new();
+
+        Id = TOOL_TITLE.Replace(" ", "");
+        Title = TOOL_TITLE;
+
+        _activeDocument = new TextDocument();
+        _activeMesh = new MeshObj();
+    }
+
+    public PreviewerToolViewModel(Workspace workspace)
+    {
+        Workspace = workspace;
+
+        Id = TOOL_TITLE.Replace(" ", "");
+        Title = TOOL_TITLE;
+
+        _activeDocument = new TextDocument("Tap an asset to preview it.");
+
+        WeakReferenceMessenger.Default.Register<AssetsSelectedMessage>(this, OnAssetsSelected);
+        WeakReferenceMessenger.Default.Register<WorkspaceClosingMessage>(this, OnWorkspaceClosing);
+    }
+
+    private void OnAssetsSelected(object recipient, AssetsSelectedMessage message)
+    {
+        var assets = message.Value;
+        if (assets.Count == 0)
+        {
+            return;
+        }
+
+        _ = PreviewAsync(assets[0]);
+    }
+
+    private void OnWorkspaceClosing(object recipient, WorkspaceClosingMessage message)
+    {
+        _cts?.Cancel();
+        ImagePreview.UpdateImage(null, null);
+        SetDisplayText(string.Empty);
+    }
+
+    private async Task PreviewAsync(AssetInst asset)
+    {
+        _cts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _cts = cts;
+        var token = cts.Token;
+
+        try
+        {
+            // wait a moment so fast scrolling / tapping does not start many decodes
+            await Task.Delay(150, token);
+
+            var funcs = _uavPluginFuncs.Value;
+            var pluginsList = Workspace.Plugins.GetPreviewersThatSupport(Workspace, asset);
+            if (pluginsList == null || pluginsList.Count == 0)
+            {
+                SetDisplayText("No preview available.");
+                return;
+            }
+
+            var firstPrevPair = pluginsList[0];
+            var prevType = firstPrevPair.PreviewType;
+            var prev = firstPrevPair.Previewer;
+
+            if (prevType == UavPluginPreviewerType.Mesh && OperatingSystem.IsAndroid())
+            {
+                SetDisplayText("3D mesh preview is not available on Android yet.");
+                return;
+            }
+
+            if (prevType == UavPluginPreviewerType.Image)
+            {
+                ImagePreview.ImageInfo = "Loading...";
+            }
+
+            await _gate.WaitAsync(token);
+            try
+            {
+                token.ThrowIfCancellationRequested();
+
+                switch (prevType)
+                {
+                    case UavPluginPreviewerType.Image:
+                    {
+                        var result = await Task.Run(() =>
+                        {
+                            var (img, fmt) = prev.ExecuteImage(Workspace, funcs, asset, out string? err);
+                            return (img, fmt, err);
+                        });
+
+                        if (token.IsCancellationRequested)
+                        {
+                            result.img?.Dispose();
+                            return;
+                        }
+
+                        if (result.img != null)
+                        {
+                            ActivePreviewType = PreviewerToolPreviewType.Image;
+                            ImagePreview.UpdateImage(result.img, (AssetsTools.NET.Texture.TextureFormat?)result.fmt);
+                        }
+                        else
+                        {
+                            SetDisplayText(result.err ?? "No preview available.");
+                        }
+                        break;
+                    }
+                    case UavPluginPreviewerType.Text:
+                    {
+                        var result = await Task.Run(() =>
+                        {
+                            var text = prev.ExecuteText(Workspace, funcs, asset, out string? err);
+                            if (text != null && text.Length > MAX_TEXT_CHARS)
+                            {
+                                text = text.Substring(0, MAX_TEXT_CHARS) + "\n\n[... cut off to keep the app fast ...]";
+                            }
+                            return (text, err);
+                        });
+
+                        if (token.IsCancellationRequested)
+                        {
+                            return;
+                        }
+
+                        if (result.text != null)
+                        {
+                            ActivePreviewType = PreviewerToolPreviewType.Text;
+                            ActiveDocument = new TextDocument(result.text);
+                        }
+                        else
+                        {
+                            SetDisplayText(result.err ?? "No preview available.");
+                        }
+                        break;
+                    }
+                    case UavPluginPreviewerType.Mesh:
+                    {
+                        var result = await Task.Run(() =>
+                        {
+                            var mesh = prev.ExecuteMesh(Workspace, funcs, asset, out string? err);
+                            return (mesh, err);
+                        });
+
+                        if (token.IsCancellationRequested)
+                        {
+                            return;
+                        }
+
+                        if (result.mesh != null)
+                        {
+                            ActivePreviewType = PreviewerToolPreviewType.Mesh;
+                            ActiveMesh = result.mesh;
+                        }
+                        else
+                        {
+                            SetDisplayText(result.err ?? "No preview available.");
+                        }
+                        break;
+                    }
+                    default:
+                    {
+                        SetDisplayText($"Preview type {prevType} not supported.");
+                        break;
+                    }
+                }
+            }
+            finally
+            {
+                _gate.Release();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            if (!token.IsCancellationRequested)
+            {
+                SetDisplayText($"Preview failed: {ex.Message}");
+            }
+        }
+    }
+
+    private void SetDisplayText(string text)
+    {
+        ImagePreview.UpdateImage(null, null);
+        ActivePreviewType = PreviewerToolPreviewType.Text;
+        ActiveDocument = new TextDocument(text);
+    }
+}
+
+public enum PreviewerToolPreviewType
+{
+    Image,
+    Text,
+    Mesh,
+}
+''')
+
+# ---- image preview: no use-after-dispose, no event leak
+replace_once(
+    "UABEANext4/ViewModels/Tools/ImagePreviewViewModel.cs",
+    "        if (Image != null) {\n            Image.Dispose();\n        }\n\n        Image = bitmap;\n",
+    "        var oldImage = Image;\n\n"
+    "        Image = bitmap;\n"
+    "        if (oldImage != null && !ReferenceEquals(oldImage, bitmap))\n"
+    "        {\n"
+    "            // give the renderer time to stop using the old picture before freeing it\n"
+    "            System.Threading.Tasks.Task.Delay(2000).ContinueWith(_ =>\n"
+    "                Avalonia.Threading.Dispatcher.UIThread.Post(() => oldImage.Dispose()));\n"
+    "        }\n",
+)
+replace_once(
+    "UABEANext4/Views/Tools/ImagePreviewView.axaml.cs",
+    "        DataContextChanged += (s, e) =>\n"
+    "        {\n"
+    "            if (DataContext is PreviewerToolViewModel vm)\n"
+    "            {\n"
+    "                vm.ImagePreview.PropertyChanged += OnImagePreviewPropertyChanged;\n"
+    "            }\n"
+    "        };\n"
+    "    }\n",
+    "        DataContextChanged += (s, e) => Rehook();\n"
+    "    }\n"
+    "\n"
+    "    private ImagePreviewViewModel? _hooked;\n"
+    "    private bool _attached;\n"
+    "\n"
+    "    private void Rehook()\n"
+    "    {\n"
+    "        ImagePreviewViewModel? target = null;\n"
+    "        if (_attached && DataContext is PreviewerToolViewModel vm)\n"
+    "        {\n"
+    "            target = vm.ImagePreview;\n"
+    "        }\n"
+    "        if (ReferenceEquals(target, _hooked))\n"
+    "        {\n"
+    "            return;\n"
+    "        }\n"
+    "        if (_hooked != null)\n"
+    "        {\n"
+    "            _hooked.PropertyChanged -= OnImagePreviewPropertyChanged;\n"
+    "        }\n"
+    "        _hooked = target;\n"
+    "        if (_hooked != null)\n"
+    "        {\n"
+    "            _hooked.PropertyChanged += OnImagePreviewPropertyChanged;\n"
+    "            TriggerFit();\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)\n"
+    "    {\n"
+    "        base.OnAttachedToVisualTree(e);\n"
+    "        _attached = true;\n"
+    "        Rehook();\n"
+    "    }\n"
+    "\n"
+    "    protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)\n"
+    "    {\n"
+    "        base.OnDetachedFromVisualTree(e);\n"
+    "        _attached = false;\n"
+    "        Rehook();\n"
+    "    }\n",
+)
+
+# ---- expose tool view models + document-opened event for the tablet shell
+replace_once(
+    "UABEANext4/ViewModels/MainDockFactory.cs",
+    "    public DocumentManager DocMan;\n",
+    "    public DocumentManager DocMan;\n"
+    "    public WorkspaceExplorerToolViewModel? ExplorerTool => _workspaceExplorerTool;\n"
+    "    public InspectorToolViewModel? InspectorTool => _inspectorToolViewModel;\n"
+    "    public PreviewerToolViewModel? PreviewerTool => _previewerToolViewModel;\n",
+)
+replace_once(
+    "UABEANext4/ViewModels/MainViewModel.cs",
+    "    private readonly MainDockFactory _factory;\n",
+    "    private readonly MainDockFactory _factory;\n\n"
+    "    public WorkspaceExplorerToolViewModel? ExplorerToolVm => _factory.ExplorerTool;\n"
+    "    public InspectorToolViewModel? InspectorToolVm => _factory.InspectorTool;\n"
+    "    public PreviewerToolViewModel? PreviewerToolVm => _factory.PreviewerTool;\n"
+    "    public event Action<AssetDocumentViewModel>? AssetDocumentOpened;\n",
+)
+replace_once(
+    "UABEANext4/ViewModels/MainViewModel.cs",
+    "            _factory.DocMan.Documents.Add(document);\n",
+    "            _factory.DocMan.Documents.Add(document);\n"
+    "            AssetDocumentOpened?.Invoke(document);\n",
+)
+
+write("UABEANext4/Views/AndroidShellView.cs", r'''using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Layout;
+using Avalonia.Media;
+using Avalonia.Threading;
+using CommunityToolkit.Mvvm.Messaging;
+using System;
+using System.Threading.Tasks;
+using UABEANext4.Logic;
+using UABEANext4.ViewModels;
+
+namespace UABEANext4.Views;
+
+/// <summary>
+/// Touch friendly layout for Android: top bar, one page at a time (Files / Assets / Preview / Data),
+/// and on wide screens the asset list and preview/data sit side by side.
+/// </summary>
+public class AndroidShellView : UserControl
+{
+    private const double WideBreakpoint = 820;
+
+    private static readonly IBrush BarBrush = new SolidColorBrush(Color.Parse("#1F2937"));
+    private static readonly IBrush ButtonBrush = new SolidColorBrush(Color.Parse("#374151"));
+    private static readonly IBrush AccentBrush = new SolidColorBrush(Color.Parse("#2563EB"));
+
+    private readonly MainViewModel _vm;
+    private readonly Grid _content = new();
+    private readonly ContentControl _filesPage = new();
+    private readonly ContentControl _assetsPage = new();
+    private readonly ContentControl _previewPage = new();
+    private readonly ContentControl _dataPage = new();
+    private readonly Button[] _tabButtons = new Button[4];
+    private readonly ProgressBar _progress = new();
+    private readonly TextBlock _status = new();
+    private int _tab = 0;
+    private bool _wide = false;
+
+    public AndroidShellView(MainViewModel vm)
+    {
+        _vm = vm;
+
+        _filesPage.Content = vm.ExplorerToolVm;
+        _previewPage.Content = vm.PreviewerToolVm;
+        _dataPage.Content = vm.InspectorToolVm;
+        _assetsPage.Content = new TextBlock
+        {
+            Text = "Open a file in the Files tab, then tap a file to see its assets here.",
+            Margin = new Thickness(16),
+            TextWrapping = TextWrapping.Wrap
+        };
+
+        _content.Children.Add(_filesPage);
+        _content.Children.Add(_assetsPage);
+        _content.Children.Add(_previewPage);
+        _content.Children.Add(_dataPage);
+
+        var root = new Grid
+        {
+            RowDefinitions = new RowDefinitions("Auto,Auto,*,Auto")
+        };
+
+        var topBar = BuildTopBar();
+        Grid.SetRow(topBar, 0);
+        root.Children.Add(topBar);
+
+        var statusGrid = new Grid();
+        _progress.Minimum = 0;
+        _progress.Maximum = 1;
+        _progress.Height = 4;
+        _progress.VerticalAlignment = VerticalAlignment.Top;
+        _status.FontSize = 11;
+        _status.Margin = new Thickness(8, 4, 8, 2);
+        _status.IsVisible = false;
+        statusGrid.Children.Add(_progress);
+        statusGrid.Children.Add(_status);
+        Grid.SetRow(statusGrid, 1);
+        root.Children.Add(statusGrid);
+
+        Grid.SetRow(_content, 2);
+        root.Children.Add(_content);
+
+        var nav = BuildNavBar();
+        Grid.SetRow(nav, 3);
+        root.Children.Add(nav);
+
+        Content = root;
+
+        vm.Workspace.PropertyChanged += (s, e) =>
+        {
+            if (e.PropertyName == "ProgressValue" || e.PropertyName == "ProgressText")
+            {
+                Dispatcher.UIThread.Post(UpdateProgress);
+            }
+        };
+
+        vm.AssetDocumentOpened += doc =>
+        {
+            _assetsPage.Content = doc;
+            SetTab(1);
+        };
+
+        WeakReferenceMessenger.Default.Register<AndroidShellView, AssetsSelectedMessage>(this, (r, m) =>
+        {
+            Dispatcher.UIThread.Post(r.OnAssetSelected);
+        });
+        WeakReferenceMessenger.Default.Register<AndroidShellView, WorkspaceClosingMessage>(this, (r, m) =>
+        {
+            Dispatcher.UIThread.Post(r.OnWorkspaceClosed);
+        });
+
+        Relayout();
+        UpdateTabButtons();
+    }
+
+    private void OnAssetSelected()
+    {
+        // on a narrow screen jump to the preview when an asset is tapped
+        if (!_wide && _tab == 1)
+        {
+            SetTab(2);
+        }
+    }
+
+    private void OnWorkspaceClosed()
+    {
+        _assetsPage.Content = new TextBlock
+        {
+            Text = "Open a file in the Files tab, then tap a file to see its assets here.",
+            Margin = new Thickness(16),
+            TextWrapping = TextWrapping.Wrap
+        };
+        SetTab(0);
+    }
+
+    private void UpdateProgress()
+    {
+        var value = _vm.Workspace.ProgressValue;
+        _progress.Value = value;
+        var busy = value > 0f && value < 1f;
+        _progress.IsVisible = busy;
+        _status.IsVisible = busy;
+        _status.Text = _vm.Workspace.ProgressText;
+    }
+
+    private Control BuildTopBar()
+    {
+        var panel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(6, 4) };
+        panel.Children.Add(MakeBarButton("Open", () => _vm.FileOpen()));
+        panel.Children.Add(MakeBarButton("Folder", () => _vm.FileOpenFolder()));
+        panel.Children.Add(MakeBarButton("Save", () => _ = _vm.FileSave()));
+
+        var menuPanel = new StackPanel { Orientation = Orientation.Vertical, MinWidth = 200 };
+        var flyout = new Flyout { Content = menuPanel };
+        void AddMenu(string text, Action action)
+        {
+            var item = new Button
+            {
+                Content = text,
+                MinHeight = 44,
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                HorizontalContentAlignment = HorizontalAlignment.Left,
+                Margin = new Thickness(0, 2)
+            };
+            item.Click += (s, e) =>
+            {
+                flyout.Hide();
+                try { action(); } catch (Exception) { }
+            };
+            menuPanel.Children.Add(item);
+        }
+        AddMenu("Save as...", () => _ = _vm.FileSaveAs());
+        AddMenu("Save all", () => _ = _vm.FileSaveAll());
+        AddMenu("Asset info", () => _vm.ShowAssetInfoDialog());
+        AddMenu("Search bytes", () => _vm.ShowSearchBytesDialog());
+        AddMenu("Options", () => _vm.ShowOptionsDialog());
+        AddMenu("Close all files", () => _vm.FileCloseAll());
+
+        var more = MakeBarButton("More", () => { });
+        more.Flyout = flyout;
+        panel.Children.Add(more);
+
+        return new Border { Background = BarBrush, Child = panel };
+    }
+
+    private static Button MakeBarButton(string text, Action onClick)
+    {
+        var button = new Button
+        {
+            Content = text,
+            MinHeight = 42,
+            MinWidth = 64,
+            Padding = new Thickness(14, 6),
+            Margin = new Thickness(3),
+            Background = ButtonBrush,
+            Foreground = Brushes.White,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        button.Click += (s, e) =>
+        {
+            try { onClick(); } catch (Exception) { }
+        };
+        return button;
+    }
+
+    private Control BuildNavBar()
+    {
+        var grid = new Grid { ColumnDefinitions = new ColumnDefinitions("*,*,*,*"), Background = BarBrush };
+        string[] names = { "Files", "Assets", "Preview", "Data" };
+        for (int i = 0; i < 4; i++)
+        {
+            int index = i;
+            var button = new Button
+            {
+                Content = names[i],
+                MinHeight = 52,
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                HorizontalContentAlignment = HorizontalAlignment.Center,
+                VerticalContentAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(2),
+                Foreground = Brushes.White
+            };
+            button.Click += (s, e) => SetTab(index);
+            Grid.SetColumn(button, i);
+            grid.Children.Add(button);
+            _tabButtons[i] = button;
+        }
+        return grid;
+    }
+
+    private void SetTab(int tab)
+    {
+        _tab = tab;
+        Relayout();
+        UpdateTabButtons();
+    }
+
+    private void UpdateTabButtons()
+    {
+        for (int i = 0; i < _tabButtons.Length; i++)
+        {
+            _tabButtons[i].Background = i == _tab ? AccentBrush : Brushes.Transparent;
+        }
+    }
+
+    protected override void OnSizeChanged(SizeChangedEventArgs e)
+    {
+        base.OnSizeChanged(e);
+        var wide = e.NewSize.Width >= WideBreakpoint;
+        if (wide != _wide)
+        {
+            _wide = wide;
+            Relayout();
+        }
+    }
+
+    private static void Place(Control control, int column, int span, bool visible)
+    {
+        Grid.SetColumn(control, column);
+        Grid.SetColumnSpan(control, span);
+        control.IsVisible = visible;
+    }
+
+    private void Relayout()
+    {
+        _content.ColumnDefinitions.Clear();
+        if (_wide && _tab != 0)
+        {
+            _content.ColumnDefinitions.Add(new ColumnDefinition(1.2, GridUnitType.Star));
+            _content.ColumnDefinitions.Add(new ColumnDefinition(1, GridUnitType.Star));
+            Place(_filesPage, 0, 1, false);
+            Place(_assetsPage, 0, 1, true);
+            Place(_previewPage, 1, 1, _tab != 3);
+            Place(_dataPage, 1, 1, _tab == 3);
+        }
+        else
+        {
+            _content.ColumnDefinitions.Add(new ColumnDefinition(1, GridUnitType.Star));
+            Place(_filesPage, 0, 1, _tab == 0);
+            Place(_assetsPage, 0, 1, _tab == 1);
+            Place(_previewPage, 0, 1, _tab == 2);
+            Place(_dataPage, 0, 1, _tab == 3);
+        }
+    }
+}
+''')
+
 # ---------------------------------------------------------------- android project files
 
 write("UABEANext4.Android/UABEANext4.Android.csproj", r'''<Project Sdk="Microsoft.NET.Sdk">
@@ -1019,6 +1850,8 @@ write("UABEANext4.Android/UABEANext4.Android.csproj", r'''<Project Sdk="Microsof
     <EmbedAssembliesIntoApk>true</EmbedAssembliesIntoApk>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <TieredPGO>false</TieredPGO>
   </PropertyGroup>
 
   <ItemGroup>
