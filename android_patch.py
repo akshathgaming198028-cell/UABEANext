@@ -811,6 +811,195 @@ replace_once(
     "using UABEANext4.Services;\nusing UABEANext4.Util;\n",
 )
 
+# bigger touch targets for lists, trees, menus and buttons (android only)
+replace_once(
+    "UABEANext4/App.axaml.cs",
+    "            singleViewPlatform.MainView = rootGrid;\n",
+    "            singleViewPlatform.MainView = rootGrid;\n            ApplyTouchStyles();\n",
+)
+replace_once(
+    "UABEANext4/App.axaml.cs",
+    "    private IServiceProvider ConfigureServices(Window? mainWindow)",
+    """    private void ApplyTouchStyles()
+    {
+        void AddMinHeight(Avalonia.Styling.Style style, double height)
+        {
+            style.Setters.Add(new Avalonia.Styling.Setter(Avalonia.Layout.Layoutable.MinHeightProperty, height));
+            Styles.Add(style);
+        }
+
+        AddMinHeight(new Avalonia.Styling.Style(x => x.OfType<Avalonia.Controls.ListBoxItem>()), 40d);
+        AddMinHeight(new Avalonia.Styling.Style(x => x.OfType<Avalonia.Controls.TreeViewItem>()), 38d);
+        AddMinHeight(new Avalonia.Styling.Style(x => x.OfType<Avalonia.Controls.MenuItem>()), 40d);
+        AddMinHeight(new Avalonia.Styling.Style(x => x.OfType<Avalonia.Controls.Button>()), 38d);
+    }
+
+    private IServiceProvider ConfigureServices(Window? mainWindow)""",
+)
+replace_once(
+    "UABEANext4/App.axaml.cs",
+    "using Avalonia.Markup.Xaml;\n",
+    "using Avalonia.Markup.Xaml;\nusing Avalonia.Styling;\n",
+)
+
+write("UABEANext4/Plugins/PluginLoader.cs", r'''using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UABEANext4.AssetWorkspace;
+using UABEANext4.Util;
+
+namespace UABEANext4.Plugins;
+public class PluginLoader
+{
+    // plugin assemblies that are already part of the app (android can't load plugin dlls at runtime)
+    public static List<Assembly> BuiltInAssemblies { get; } = [];
+
+    private readonly List<IUavPluginOption> _pluginOptions = [];
+    private readonly List<IUavPluginPreviewer> _pluginPreviewers = [];
+    private readonly HashSet<string> _loadedPaths = new(StringComparer.OrdinalIgnoreCase);
+
+    public bool LoadPlugin(string path)
+    {
+        try
+        {
+            var fullPath = Path.GetFullPath(path);
+
+            if (_loadedPaths.Contains(fullPath))
+                return true;
+
+            if (!File.Exists(fullPath))
+                return false;
+
+            var plugLoadCtx = new PluginLoadContext(fullPath);
+            var asm = plugLoadCtx.LoadAssemblyByPath(fullPath);
+
+            var anyAdded = RegisterAssembly(asm);
+            if (anyAdded)
+            {
+                _loadedPaths.Add(fullPath);
+            }
+
+            return anyAdded;
+        }
+        catch
+        {
+            return false;
+        }
+
+    }
+
+    public void LoadBuiltInPlugins()
+    {
+        foreach (var asm in BuiltInAssemblies)
+        {
+            try
+            {
+                RegisterAssembly(asm);
+            }
+            catch
+            {
+                // skip a plugin that fails to register rather than crash the app
+            }
+        }
+    }
+
+    private bool RegisterAssembly(Assembly asm)
+    {
+        bool anyAdded = false;
+
+        foreach (Type type in asm.GetTypes())
+        {
+            if (type.IsAbstract || type.IsInterface)
+                continue;
+
+            if (typeof(IUavPluginOption).IsAssignableFrom(type))
+            {
+                if (_pluginOptions.Any(o => o.GetType() == type))
+                {
+                    continue;
+                }
+
+                if (Activator.CreateInstance(type) is IUavPluginOption plugInst)
+                {
+                    _pluginOptions.Add(plugInst);
+                    anyAdded = true;
+                }
+            }
+            else if (typeof(IUavPluginPreviewer).IsAssignableFrom(type))
+            {
+                if (_pluginPreviewers.Any(p => p.GetType() == type))
+                {
+                    continue;
+                }
+
+                if (Activator.CreateInstance(type) is IUavPluginPreviewer plugInst)
+                {
+                    _pluginPreviewers.Add(plugInst);
+                    anyAdded = true;
+                }
+            }
+        }
+
+        return anyAdded;
+    }
+
+    public void LoadPluginsInDirectory(string directory)
+    {
+        if (!Directory.Exists(directory))
+        {
+            Directory.CreateDirectory(directory);
+            return;
+        }
+
+        foreach (string file in Directory.EnumerateFiles(directory, "*.dll"))
+        {
+            LoadPlugin(file);
+        }
+    }
+
+    public List<PluginOptionModePair> GetOptionsThatSupport(Workspace workspace, List<AssetInst> assets, UavPluginMode mode)
+    {
+        var options = new List<PluginOptionModePair>();
+        foreach (var option in _pluginOptions)
+        {
+            var bothOpt = mode & option.Options;
+            foreach (var flag in bothOpt.GetUniqueFlags())
+            {
+                if (flag == UavPluginMode.All)
+                    continue;
+
+                var supported = option.SupportsSelection(workspace, flag, assets);
+                if (supported)
+                    options.Add(new PluginOptionModePair(option, flag));
+            }
+        }
+
+        return options;
+    }
+
+    public List<PluginPreviewerTypePair> GetPreviewersThatSupport(Workspace workspace, AssetInst asset)
+    {
+        var previewers = new List<PluginPreviewerTypePair>();
+        foreach (var previewer in _pluginPreviewers)
+        {
+            var previewType = previewer.SupportsPreview(workspace, asset);
+            if (previewType != UavPluginPreviewerType.None)
+                previewers.Add(new PluginPreviewerTypePair(previewer, previewType));
+        }
+
+        return previewers;
+    }
+}
+''')
+
+replace_once(
+    "UABEANext4/AssetWorkspace/Workspace.cs",
+    "        Plugins.LoadPluginsInDirectory(pluginsPath);\n",
+    "        Plugins.LoadPluginsInDirectory(pluginsPath);\n        Plugins.LoadBuiltInPlugins();\n",
+)
+
 # ---------------------------------------------------------------- android project files
 
 write("UABEANext4.Android/UABEANext4.Android.csproj", r'''<Project Sdk="Microsoft.NET.Sdk">
@@ -838,6 +1027,12 @@ write("UABEANext4.Android/UABEANext4.Android.csproj", r'''<Project Sdk="Microsof
 
   <ItemGroup>
     <ProjectReference Include="..\UABEANext4\UABEANext4.csproj" />
+    <!-- plugins are built into the app on android (dynamic plugin loading is not supported there) -->
+    <ProjectReference Include="..\TexturePlugin\TexturePlugin.csproj" />
+    <ProjectReference Include="..\AudioPlugin\AudioPlugin.csproj" />
+    <ProjectReference Include="..\TextAssetPlugin\TextAssetPlugin.csproj" />
+    <ProjectReference Include="..\MeshPlugin\MeshPlugin.csproj" />
+    <ProjectReference Include="..\FontPlugin\FontPlugin.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -862,6 +1057,7 @@ using Android.Content.PM;
 using Android.OS;
 using Avalonia;
 using Avalonia.Android;
+using UABEANext4.Plugins;
 using AndroidUri = Android.Net.Uri;
 
 namespace UABEANext4.Android;
@@ -878,6 +1074,7 @@ public class MainActivity : AvaloniaMainActivity<App>
         System.AppDomain.CurrentDomain.UnhandledException += (s, e) => WriteCrashLog(e.ExceptionObject?.ToString());
 
         PrepareAppFiles();
+        RegisterBuiltInPlugins();
         base.OnCreate(savedInstanceState);
         AskForAllFilesAccess();
     }
@@ -906,6 +1103,16 @@ public class MainActivity : AvaloniaMainActivity<App>
         {
             WriteCrashLog("PrepareAppFiles failed: " + ex);
         }
+    }
+
+    // plugins can't be loaded from dll files on android, so they are compiled into the app
+    private static void RegisterBuiltInPlugins()
+    {
+        PluginLoader.BuiltInAssemblies.Add(typeof(TexturePlugin.TexturePreviewer).Assembly);
+        PluginLoader.BuiltInAssemblies.Add(typeof(AudioPlugin.ExportAudioOption).Assembly);
+        PluginLoader.BuiltInAssemblies.Add(typeof(TextAssetPlugin.TextAssetPreviewer).Assembly);
+        PluginLoader.BuiltInAssemblies.Add(typeof(MeshPlugin.MeshPreviewer).Assembly);
+        PluginLoader.BuiltInAssemblies.Add(typeof(FontPlugin.ExportFontOption).Assembly);
     }
 
     private void AskForAllFilesAccess()
