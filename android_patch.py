@@ -695,7 +695,7 @@ public class OverlayDialogService(ViewLocator viewLocator) : IDialogService
         header.Children.Add(closeButton);
 
         var panel = new DockPanel();
-        DockPanel.SetDock(header, Dock.Top);
+        DockPanel.SetDock(header, Avalonia.Controls.Dock.Top);
         panel.Children.Add(header);
         panel.Children.Add(view);
 
